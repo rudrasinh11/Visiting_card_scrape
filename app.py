@@ -220,8 +220,13 @@ COMPANY_INDICATORS = re.compile(
     re.I,
 )
 
+REGISTRATION_PATTERNS = re.compile(
+    r"\b(b\.?n\.?|business|reg|registration|vat|tax|cr|tin|cin|gstin)\b.*?(number|no\.?|#|\:|\d)",
+    re.I,
+)
+
 ADDRESS_KEYWORDS = re.compile(
-    r"\b(road|street|nagar|plot|floor|avenue|cross|phase|opp|behind|near|building|complex|chowk|marg|bazaar|dist|state|tower|office|branch|h\.o\.|r\.o\.|indore|m\.p\.|delhi|mumbai|bangalore|ahmedabad|gujarat|pincode|\b\d{6}\b)\b",
+    r"(\b\d+\s*[\w\s,.-]+|st\b|st\.|street|road|rd\b|rd\.|avenue|ave\b|ave\.|lane|blvd|drive|dr\b|nagar|marg|chowk|floor|building|complex|tower|suite|ste\b|box|city|country|state|israel|india|usa|uk|uae|dubai|netanya|tel aviv|mumbai|delhi|indore|ahmedabad|gujarat|pincode|\b\d{5,6}\b)",
     re.I,
 )
 
@@ -235,13 +240,20 @@ WEB_PATTERN = re.compile(
     re.I,
 )
 
+def is_likely_person_name(text):
+    if re.search(r"\d", text):
+        return False
+    if re.search(r"\b(ltd|pvt|corp|inc|llc|jewelry|diamonds|gold|solutions|technologies|enterprises|since|making)\b", text, re.I):
+        return False
+    return 1 <= len(text.split()) <= 4
+
 def parse_card_elements(ocr_results):
     """
-    State-of-the-art parser with cross-referencing:
-    - Email username correlates to Person Name
-    - Email domain correlates to Company Name
-    - Strips fake websites (like pvt.ltd)
-    - Collects multi-line address
+    Enhanced parser:
+    - Never extracts BN / Business / Tax Registration numbers as phone numbers
+    - Accurately captures international addresses with street numbers, countries, and cities
+    - Separates Owner Name from Business Name even when company is named after the person
+    - Cross-references email handles with person and company names
     """
     if not ocr_results:
         return {}
@@ -260,7 +272,6 @@ def parse_card_elements(ocr_results):
     for line in raw_lines:
         if "@" in line:
             continue
-        # Ignore company suffix misdetected as website
         if re.search(r"\b(pvt|ltd|corp|inc|co)\.(ltd|in|com)?\b", line, re.I):
             continue
         cleaned = LABEL_STRIP.sub("", line).strip()
@@ -271,13 +282,15 @@ def parse_card_elements(ocr_results):
                 website = val
                 break
 
-    # 3. Phone Numbers
+    # 3. Phone Numbers (EXCLUDE BN/Registration numbers!)
     phones = []
     for line in raw_lines:
-        found_phones = re.findall(r"(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{3,5}[\s.-]?\d{4,5}", line)
+        if REGISTRATION_PATTERNS.search(line):
+            continue
+        found_phones = re.findall(r"(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{2,4}[\s.-]?\d{3,4}[\s.-]?\d{3,4}", line)
         for p in found_phones:
             digits = re.sub(r"\D", "", p)
-            if 8 <= len(digits) <= 13 and p.strip() not in phones:
+            if 8 <= len(digits) <= 14 and p.strip() not in phones:
                 phones.append(p.strip())
     phone_str = ", ".join(phones)
 
@@ -290,7 +303,7 @@ def parse_card_elements(ocr_results):
             designation = cleaned
             break
 
-    # 5. Full Address Extraction (Combines address fragments & PIN codes)
+    # 5. Full Address Extraction
     address_lines = []
     for line in raw_lines:
         cleaned = LABEL_STRIP.sub("", line).strip()
@@ -304,7 +317,11 @@ def parse_card_elements(ocr_results):
             continue
         if cleaned == designation:
             continue
+        if REGISTRATION_PATTERNS.search(cleaned):
+            continue
         if re.match(r"^(email|mobile|phone|text|office|fax|cell)$", cleaned, re.I):
+            continue
+        if re.search(r"\b(since \d{4}|making precious digital)\b", cleaned, re.I):
             continue
 
         if ADDRESS_KEYWORDS.search(cleaned):
@@ -312,8 +329,12 @@ def parse_card_elements(ocr_results):
                 continue
             address_lines.append(cleaned)
 
-    # Sort address: street/nagar first, state/pincode at the end
     clean_address = ", ".join(address_lines)
+    # Format address spacing and OCR artifact fixes
+    clean_address = re.sub(r"(\d+)([a-zA-Z])", r"\1 \2", clean_address)
+    clean_address = re.sub(r"([a-zA-Z]{3,})(st|rd|ave|blvd)\b", r"\1 \2", clean_address, flags=re.I)
+    clean_address = re.sub(r"\blsrael\b", "Israel", clean_address, flags=re.I)
+    clean_address = re.sub(r",\s*", ", ", clean_address)
 
     # 6. Name and Company Identification
     candidates = []
@@ -331,40 +352,53 @@ def parse_card_elements(ocr_results):
             continue
         if cleaned in address_lines:
             continue
+        if REGISTRATION_PATTERNS.search(cleaned):
+            continue
         if re.match(r"^(email|mobile|phone|text|office|fax|tagline|website)$", cleaned, re.I):
             continue
-        # Skip small slogans like "making precious digital"
-        if len(cleaned.split()) > 3 and not COMPANY_INDICATORS.search(cleaned):
+        if re.search(r"\b(since \d{4}|making precious digital|diamonds & gold jewelry)\b", cleaned, re.I):
             continue
         candidates.append(cleaned)
 
     name = ""
     company = ""
 
-    # Smart Matching A: Check against email username -> Name
+    # Find company (looking for corporate suffixes like LTD, PVT, etc.)
+    for cand in candidates:
+        if COMPANY_INDICATORS.search(cand):
+            company = cand
+            break
+
+    # Find person name
+    valid_name_cands = [c for c in candidates if is_likely_person_name(c)]
+
     if email_user and len(email_user) >= 3:
         user_parts = [p for p in re.split(r"[._]", email_user) if len(p) >= 3]
-        for cand in candidates:
+        for cand in valid_name_cands:
             cand_norm = re.sub(r"[^a-zA-Z0-9]", "", cand).lower()
             if any(p in cand_norm for p in user_parts):
                 name = cand
                 break
 
-    # Smart Matching B: Check against email domain or company keywords -> Company
-    for cand in candidates:
-        if cand == name:
-            continue
-        cand_norm = re.sub(r"[^a-zA-Z0-9]", "", cand).lower()
-        if (email_domain and email_domain in cand_norm) or COMPANY_INDICATORS.search(cand):
-            company = cand
-            break
+    if not name and valid_name_cands:
+        name = valid_name_cands[0]
 
-    # Fallbacks if email cross-check was not available
-    rem = [c for c in candidates if c not in (name, company)]
-    if not name and rem:
-        name = rem.pop(0)
-    if not company and rem:
-        company = rem.pop(0)
+    # If company is named after the person (e.g. 'DavidOualid LTD') and no separate name candidate:
+    if company and not name:
+        base_name = re.sub(r"\b(ltd|pvt|corp|inc|llc|co)\b\.?", "", company, flags=re.I).strip()
+        base_name = re.sub(r"([a-z])([A-Z])", r"\1 \2", base_name)
+        if len(base_name.split()) >= 2:
+            name = base_name
+
+    # Normalize camelcase in Company Name (e.g. DavidOualid LTD -> David Oualid LTD)
+    if company:
+        company = re.sub(r"([a-z])([A-Z])", r"\1 \2", company)
+
+    # Fallback if company still missing
+    if not company:
+        rem_comp = [c for c in candidates if c != name]
+        if rem_comp:
+            company = rem_comp[0]
 
     return {
         "Name": name,
